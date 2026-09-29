@@ -1,0 +1,29 @@
+# Gradle / Android
+.gradle/
+build/
+*/build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof
+
+# 签名文件：自己保管，不要提交
+keystore/
+*.jks
+*.keystore
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 打包产物：APK 是二进制，发到 GitHub Releases，不要塞进 git 历史
+dist/*.apk
+
+# 旧项目压缩包（用于对比分析，不属于本项目）
+*.zip
+# 我自己的题库内容与内部资料：不进公开仓库（本地保留）
+dist/Word题库转换结果/
+docs/旧版实现-功能与交互清单.md

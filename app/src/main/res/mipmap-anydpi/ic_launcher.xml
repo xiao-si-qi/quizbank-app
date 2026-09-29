@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 24/25 无自适应图标，退回普通矢量图标 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M12,12 h84 a8,8 0 0 1 8,8 v68 a8,8 0 0 1 -8,8 h-84 a8,8 0 0 1 -8,-8 v-68 a8,8 0 0 1 8,-8 z"
+        android:fillColor="#2563EB" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,30 h42 a6,6 0 0 1 6,6 v34 a6,6 0 0 1 -6,6 h-42 a6,6 0 0 1 -6,-6 v-34 a6,6 0 0 1 6,-6 z" />
+    <path
+        android:pathData="M36,44 h28"
+        android:strokeColor="#1D4ED8"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M36,54 h20"
+        android:strokeColor="#1D4ED8"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round" />
+</vector>
