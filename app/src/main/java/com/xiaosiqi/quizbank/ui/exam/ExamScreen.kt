@@ -1,5 +1,6 @@
 package com.xiaosiqi.quizbank.ui.exam
 
+import androidx.compose.foundation.layout.PaddingValues
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
@@ -515,14 +516,45 @@ fun ExamScreen(container: AppContainer, nav: NavController, bankId: Long) {
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        OutlinedButton(onClick = vm::prev, enabled = state.index > 0, modifier = Modifier.weight(1f)) {
-                            Text("上一题")
+                        val compact = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
+                        OutlinedButton(
+                            onClick = vm::prev,
+                            enabled = state.index > 0,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = compact,
+                        ) { Text("上一题", maxLines = 1) }
+
+                        // 多选题、填空题要显式提交才会判分；简答题要「看答案」后自评
+                        val current = state.current
+                        if (current != null && !current.revealed) {
+                            when (state.currentType) {
+                                QuestionType.MULTIPLE -> Button(
+                                    onClick = vm::submitAnswer,
+                                    enabled = current.my.isNotBlank(),
+                                    modifier = Modifier.weight(1.2f),
+                                    contentPadding = compact,
+                                ) { Text("提交答案", maxLines = 1) }
+                                QuestionType.BLANK -> Button(
+                                    onClick = vm::submitAnswer,
+                                    enabled = state.input.isNotBlank(),
+                                    modifier = Modifier.weight(1.2f),
+                                    contentPadding = compact,
+                                ) { Text("提交答案", maxLines = 1) }
+                                QuestionType.ESSAY -> Button(
+                                    onClick = vm::reveal,
+                                    modifier = Modifier.weight(1.2f),
+                                    contentPadding = compact,
+                                ) { Text("看答案", maxLines = 1) }
+                                else -> Unit
+                            }
                         }
+
                         Button(
                             onClick = { if (state.index >= state.totalQuestions - 1) confirmSubmit = true else vm.next() },
-                            modifier = Modifier.weight(1.4f),
+                            modifier = Modifier.weight(1.2f),
+                            contentPadding = compact,
                         ) {
-                            Text(if (state.index >= state.totalQuestions - 1) "交卷" else "下一题")
+                            Text(if (state.index >= state.totalQuestions - 1) "交卷" else "下一题", maxLines = 1)
                         }
                     }
                 }
