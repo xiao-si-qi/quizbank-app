@@ -68,6 +68,8 @@ class SettingsStore(context: Context) : SettingsGateway {
             putBoolean(KEY_ADMIN_OVERVIEW, next.allowAdminOverview)
             putBoolean(KEY_AUTO_CONFIGURE, next.autoConfigurePaths)
             putBoolean(KEY_BUILTIN_FALLBACK, next.useBuiltinFallback)
+            putLong(KEY_LAST_UPDATE_CHECK, next.lastUpdateCheckAt)
+            putString(KEY_SKIPPED_VERSION, next.skippedVersion)
         }.apply()
         _state.value = next
     }
@@ -98,6 +100,8 @@ class SettingsStore(context: Context) : SettingsGateway {
         allowAdminOverview = prefs.getBoolean(KEY_ADMIN_OVERVIEW, true),
         autoConfigurePaths = prefs.getBoolean(KEY_AUTO_CONFIGURE, true),
         useBuiltinFallback = prefs.getBoolean(KEY_BUILTIN_FALLBACK, true),
+        lastUpdateCheckAt = prefs.getLong(KEY_LAST_UPDATE_CHECK, 0L),
+        skippedVersion = prefs.getString(KEY_SKIPPED_VERSION, "").orEmpty(),
     )
 
     private companion object {
@@ -126,5 +130,7 @@ class SettingsStore(context: Context) : SettingsGateway {
         const val KEY_ADMIN_OVERVIEW = "admin_overview"
         const val KEY_AUTO_CONFIGURE = "auto_configure_paths"
         const val KEY_BUILTIN_FALLBACK = "builtin_fallback"
+        const val KEY_LAST_UPDATE_CHECK = "last_update_check"
+        const val KEY_SKIPPED_VERSION = "skipped_version"
     }
 }

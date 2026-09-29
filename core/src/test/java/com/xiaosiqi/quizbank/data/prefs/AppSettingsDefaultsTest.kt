@@ -163,6 +163,8 @@ private class FakeExamStore : com.xiaosiqi.quizbank.data.QuizStore {
     }
     override fun exams(limit: Int) = records.take(limit)
     override fun exam(localId: Long) = records.firstOrNull { it.localId == localId }
+    override fun inProgressExam(bankId: Long) =
+        records.firstOrNull { it.bankId == bankId && it.inProgress }
     override fun deleteExam(localId: Long) { records.removeAll { it.localId == localId } }
     override fun markExamUploaded(localId: Long, remotePath: String) {
         val i = records.indexOfFirst { it.localId == localId }

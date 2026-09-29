@@ -1,5 +1,10 @@
 package com.xiaosiqi.quizbank.ui.home
 
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import android.content.Intent
+import com.xiaosiqi.quizbank.update.AppRelease
+import com.xiaosiqi.quizbank.update.UpdateChecker
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
@@ -70,6 +75,7 @@ import com.xiaosiqi.quizbank.data.repo.BankListSnapshot
 import com.xiaosiqi.quizbank.data.repo.ImportSummary
 import com.xiaosiqi.quizbank.importer.ImportException
 import com.xiaosiqi.quizbank.model.Bank
+import com.xiaosiqi.quizbank.model.BankListItem
 import com.xiaosiqi.quizbank.model.BankProgress
 import com.xiaosiqi.quizbank.model.BankStats
 import com.xiaosiqi.quizbank.model.OverallStats
@@ -149,12 +155,94 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
+    /** 上次看到的登录状态，用来发现「刚刚登录成功」这一刻 */
+    private var wasLoggedIn: Boolean? = null
+
+    /** 发现的新版本（非空就弹更新提示） */
+    private val _update = MutableStateFlow<AppRelease?>(null)
+    val update: StateFlow<AppRelease?> = _update.asStateFlow()
+
+    /**
+     * 检查 GitHub Releases 有没有新版本。
+     * 自动检查一天只查一次（GitHub 匿名 API 有频率限制）；手动检查不受限制。
+     */
+    fun checkUpdate(manual: Boolean = false) {
+        viewModelScope.launch {
+            val settings = container.settings.current()
+            val now = System.currentTimeMillis()
+            if (!manual && now - settings.lastUpdateCheckAt < UpdateChecker.AUTO_CHECK_INTERVAL_MS) return@launch
+            container.settings.edit { it.copy(lastUpdateCheckAt = now) }
+            val release = runCatching { container.updates.latest() }.getOrNull()
+            when {
+                release == null -> if (manual) _message.value = "检查更新失败，请检查网络后重试"
+                !UpdateChecker.isNewer(container.appVersion, release.version) ->
+                    if (manual) _message.value = "已经是最新版本（${container.appVersion}）"
+                !manual && release.version == settings.skippedVersion -> Unit
+                else -> _update.value = release
+            }
+        }
+    }
+
+    fun dismissUpdate(skipVersion: String? = null) {
+        if (skipVersion != null) container.settings.edit { it.copy(skippedVersion = skipVersion) }
+        _update.value = null
+    }
+
     /** 重新检查登录态并刷新（从登录页/设置页返回时调用）。 */
     fun onResume() {
         viewModelScope.launch {
             runCatching { container.session.applyAutoDefaults() }
+            val loggedIn = container.settings.current().loggedIn
             refresh()
+            // 刚从匿名变成登录：自动把登录后能看到的题库全拉下来，不用用户手动同步
+            if (wasLoggedIn == false && loggedIn) autoLoadAfterLogin()
+            wasLoggedIn = loggedIn
+            checkUpdate()
         }
+    }
+
+    /**
+     * 登录成功后自动加载「全部题库」。
+     *
+     * 只下载本地还没有的（按 remoteId / 文件地址判断），已经下过的不重复下。
+     * 登录后清单会从「公开清单」切到「完整清单」，所以这里拿到的是全部题库。
+     */
+    private suspend fun autoLoadAfterLogin() {
+        _state.update {
+            it.copy(bootstrapping = true, bootstrapStatus = "正在获取全部题库…", bootstrapFailed = false)
+        }
+        val settings = container.settings.current()
+        val snapshot = fetchListWithFallback(settings)
+        if (snapshot == null || snapshot.items.isEmpty()) {
+            _state.update { it.copy(bootstrapping = false, bootstrapStatus = null) }
+            return
+        }
+
+        fun keyOf(item: BankListItem) = item.remoteId.ifBlank { item.fileUrl }
+        val have = withContext(Dispatchers.IO) {
+            container.store.banks().map { it.remoteId.ifBlank { it.fileUrl } }.toSet()
+        }
+        val targets = snapshot.items.filter { keyOf(it) !in have }
+        if (targets.isEmpty()) {
+            _state.update { it.copy(bootstrapping = false, bootstrapStatus = null) }
+            return
+        }
+
+        var ok = 0
+        targets.forEachIndexed { index, item ->
+            _state.update {
+                it.copy(bootstrapStatus = "正在下载「${item.name}」 ${index + 1}/${targets.size}")
+            }
+            runCatching { container.repository.importBankItem(item, snapshot.sourceLabel) }
+                .onSuccess { summary ->
+                    ok++
+                    prefetchImages(summary)
+                }
+                .onFailure { /* 单个题库失败不影响其它 */ }
+        }
+        _state.update { it.copy(bootstrapping = false, bootstrapStatus = null) }
+        refresh()
+        if (ok > 0) _message.value = "登录成功，已自动加载 $ok 个题库"
     }
 
     fun dismissBanner() = _state.update { it.copy(bannerDismissed = true) }
@@ -419,6 +507,10 @@ fun HomeScreen(container: AppContainer, nav: NavController) {
                                 onClick = { menuOpen = false; nav.navigate(Routes.collection(CollectionKind.FAVORITE)) },
                             )
                             DropdownMenuItem(
+                                text = { Text("检查更新") },
+                                onClick = { menuOpen = false; vm.checkUpdate(manual = true) },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("设置") },
                                 onClick = { menuOpen = false; nav.navigate(Routes.SETTINGS) },
                             )
@@ -549,6 +641,46 @@ fun HomeScreen(container: AppContainer, nav: NavController) {
 
     ErrorDialog(message = error, onDismiss = vm::clearError)
     MessageDialog(message = message, onDismiss = vm::clearMessage)
+
+    // 发现新版本
+    val pendingUpdate by vm.update.collectAsState()
+    val updateContext = LocalContext.current
+    pendingUpdate?.let { r ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissUpdate() },
+            title = { Text("发现新版本 ${r.tag}") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text(
+                        "当前版本 ${container.appVersion}" + if (r.sizeText.isNotBlank()) " · 新包 ${r.sizeText}" else "",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (r.notes.isNotBlank()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(r.notes.take(2000), style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    runCatching {
+                        updateContext.startActivity(
+                            Intent(Intent.ACTION_VIEW, android.net.Uri.parse(r.downloadUrl))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                    vm.dismissUpdate()
+                }) { Text("去下载") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { vm.dismissUpdate(r.version) }) { Text("跳过此版本") }
+                    TextButton(onClick = { vm.dismissUpdate() }) { Text("稍后") }
+                }
+            },
+        )
+    }
 }
 
 @Composable

@@ -53,6 +53,8 @@ class ExamUploadLiveTest {
 
         override fun exams(limit: Int) = records.sortedByDescending { it.finishedAt }.take(limit)
         override fun exam(localId: Long) = records.firstOrNull { it.localId == localId }
+    override fun inProgressExam(bankId: Long) =
+        records.firstOrNull { it.bankId == bankId && it.inProgress }
         override fun deleteExam(localId: Long) {
             records.removeAll { it.localId == localId }
         }

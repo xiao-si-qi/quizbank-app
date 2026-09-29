@@ -64,6 +64,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.xiaosiqi.quizbank.AppContainer
 import com.xiaosiqi.quizbank.domain.AnswerJudge
+import com.xiaosiqi.quizbank.exam.ExamDetail
+import com.xiaosiqi.quizbank.data.prefs.AppSettings
+import com.xiaosiqi.quizbank.model.Option
 import com.xiaosiqi.quizbank.exam.ExamBuilder
 import com.xiaosiqi.quizbank.exam.ExamJson
 import com.xiaosiqi.quizbank.exam.ExamMeta
@@ -82,6 +85,8 @@ import com.xiaosiqi.quizbank.ui.common.LoadingBox
 import com.xiaosiqi.quizbank.ui.common.RichTextView
 import com.xiaosiqi.quizbank.ui.common.SectionCard
 import com.xiaosiqi.quizbank.ui.common.TypeChip
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -97,6 +102,15 @@ import kotlinx.coroutines.withContext
  * - 交卷后统一判分，生成成绩（总分/得分/百分制）并保存成考试记录
  * - 只有考试才会生成成绩并上传；普通练习只记错题
  */
+/**
+ * 考试模式。
+ *
+ * 和练习的区别是：进来先按组卷规则抽一套卷，**点「考试」的那一刻就落一条记录**，
+ * 之后边答边判、边答边存——中途退出再进来能接着考；交卷后这条记录定型为成绩。
+ *
+ * 整个页面以 [ExamRecord] 为唯一真相来源（含题目快照与每题作答），
+ * 所以「续考」不需要额外恢复逻辑：读出记录就能继续。
+ */
 class ExamViewModel(
     private val container: AppContainer,
     private val bankId: Long,
@@ -105,198 +119,316 @@ class ExamViewModel(
     data class UiState(
         val loading: Boolean = true,
         val bank: Bank? = null,
-        val paper: ExamPaper? = null,
+        /** 当前这场考试（进行中或已交卷） */
+        val record: ExamRecord? = null,
         val index: Int = 0,
-        val choices: Map<Int, List<String>> = emptyMap(),
-        val texts: Map<Int, String> = emptyMap(),
+        /** 当前题的输入框内容（填空/简答） */
+        val input: String = "",
         val submitted: Boolean = false,
         val reviewIndex: Int? = null,
-        val record: ExamRecord? = null,
-        val result: ExamResult? = null,
         val empty: Boolean = false,
+        /** 这次进来是接着上次考的 */
+        val resumed: Boolean = false,
         val error: String? = null,
         val message: String? = null,
         val uploadState: String? = null,
         val canUpload: Boolean = false,
         val autoUpload: Boolean = false,
         val busy: Boolean = false,
+        /** 云端同步状态，显示在标题下面那一行 */
+        val cloudState: String? = null,
     ) {
-        val totalQuestions: Int get() = paper?.questionCount ?: 0
-        val totalPoints: Int get() = paper?.totalPoints ?: 0
-        val current: Question? get() = paper?.items?.getOrNull(index)?.question
-        val currentScore: Int get() = paper?.items?.getOrNull(index)?.score ?: 0
-        val answeredCount: Int get() = choices.size + texts.count { it.value.isNotBlank() }
+        val details: List<ExamDetail> get() = record?.details.orEmpty()
+        val totalQuestions: Int get() = details.size
+        val totalPoints: Int get() = record?.totalPoints ?: 0
+        val current: ExamDetail? get() = details.getOrNull(index)
+        val answeredCount: Int get() = details.count { it.my.isNotBlank() }
+        val currentType: QuestionType?
+            get() = current?.let { QuestionType.fromText(it.type) }
     }
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
-    private var startedAt = System.currentTimeMillis()
+    private companion object {
+        /** 进行中考试的云端同步节流间隔 */
+        const val SYNC_THROTTLE_MS = 5_000L
+    }
 
     init {
         start()
     }
 
+    /** 有没交卷的就接着考，否则当场抽一套新卷并立刻落库。 */
     fun start() {
         viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null) }
+            val settings = container.settings.current()
             val data = withContext(Dispatchers.IO) {
                 val bank = container.store.bank(bankId)
-                val questions = container.store.questions(bankId)
-                val paper = if (bank == null) null else ExamBuilder.build(questions, bank.examBlueprint)
-                Triple(bank, questions.size, paper)
+                val local = container.exams.inProgress(bankId)
+
+                // 登录用户：再看看云端有没有更新的一份（换手机续考）
+                val online = settings.loggedIn && settings.autoUploadScore
+                val cloudLocal = if (online && container.exams.hasUploadTarget()) {
+                    runCatching { container.exams.findInProgress(bankId) }.getOrNull()
+                } else null
+
+                var chosen = when {
+                    cloudLocal == null -> local
+                    local == null -> cloudLocal
+                    cloudLocal.updatedAt > local.updatedAt -> cloudLocal
+                    else -> local
+                }
+                var fromCloud = false
+                if (chosen != null && chosen!!.localId == 0L) {
+                    // 来自云端：落一份到本机，并把本机那份旧的清掉，避免同题库两条进行中
+                    local?.let { container.exams.deleteLocal(it.localId) }
+                    chosen = chosen!!.copy(localId = container.exams.saveLocal(chosen!!))
+                    fromCloud = true
+                }
+
+                if (chosen != null) {
+                    return@withContext Triple(bank, chosen, true to fromCloud)
+                }
+
+                val paper = if (bank == null) null
+                else ExamBuilder.build(container.store.questions(bankId), bank.examBlueprint)
+                if (paper == null || paper.questionCount == 0) {
+                    return@withContext Triple(bank, null, false to false)
+                }
+                val fresh = ExamRecord.start(
+                    paper = paper,
+                    meta = metaOf(bank, settings, startedAt = System.currentTimeMillis(), finishedAt = 0L),
+                )
+                // 点「考试」就落库：这时候记录还是「进行中」
+                Triple(bank, fresh.copy(localId = container.exams.saveLocal(fresh)), false to false)
             }
-            val (bank, available, paper) = data
-            val settings = container.settings.current()
-            startedAt = System.currentTimeMillis()
+            val (bank, record, flags) = data
+            val (resumed, fromCloud) = flags
             _state.update {
                 UiState(
                     loading = false,
                     bank = bank,
-                    paper = paper,
-                    empty = paper == null || paper.questionCount == 0,
+                    record = record,
+                    index = record?.index ?: 0,
+                    empty = record == null,
+                    resumed = resumed,
                     canUpload = container.exams.hasUploadTarget(),
                     autoUpload = settings.autoUploadScore,
-                    message = if (bank != null && paper != null && paper.questionCount > 0) {
-                        "本次试卷共 ${paper.questionCount} 题、满分 ${paper.totalPoints} 分"
-                    } else null,
+                    message = when {
+                        record == null -> null
+                        resumed -> (if (fromCloud) "已从云端恢复" else "已恢复上次") +
+                            "没考完的考试：第 ${record.index + 1}/${record.questionCount} 题，" +
+                            "已答 ${record.details.count { d -> d.my.isNotBlank() }} 题"
+                        else -> "本次试卷共 ${record.questionCount} 题、满分 ${record.totalPoints} 分"
+                    },
                 )
-            }
-            if (bank != null && paper != null && paper.questionCount == 0 && available == 0) {
-                _state.update { it.copy(empty = true) }
             }
         }
     }
+
+    private fun metaOf(bank: Bank?, settings: AppSettings, startedAt: Long, finishedAt: Long) = ExamMeta(
+        user = settings.effectiveName,
+        bankId = bankId,
+        bankName = bank?.name.orEmpty(),
+        bankKey = bank?.remoteId?.ifBlank { bank?.fileUrl.orEmpty() }.orEmpty(),
+        category = bank?.category.orEmpty(),
+        startedAt = startedAt,
+        finishedAt = finishedAt,
+        device = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+    )
+
+    /** 把记录里的一道题还原成可判分的题目。 */
+    private fun questionOf(d: ExamDetail): Question = Question(
+        id = 0L,
+        orderIndex = d.index - 1,
+        type = QuestionType.fromText(d.type) ?: QuestionType.SINGLE,
+        stem = d.stem,
+        options = d.optionKeys.mapIndexed { i, key -> Option(key, d.options.getOrNull(i).orEmpty()) },
+        answers = d.answerKeys,
+        analysis = d.analysis,
+    )
+
+    private fun split(text: String): List<String> =
+        text.split('|', '｜', ';', '；', ',').map { it.trim() }.filter { it.isNotEmpty() }
 
     // ------------------------------------------------------------ 作答
 
+    /** 选择题点选项：单选/判断立刻判分，多选先记下来等「提交答案」。 */
     fun choose(key: String) {
         val s = _state.value
-        val question = s.current ?: return
-        if (s.submitted) return
-        when (question.type) {
-            QuestionType.MULTIPLE -> {
-                val now = s.choices[s.index].orEmpty()
-                val next = if (key in now) now - key else now + key
-                _state.update { it.copy(choices = it.choices + (s.index to next.sorted())) }
-            }
-            else -> _state.update { it.copy(choices = it.choices + (s.index to listOf(key))) }
+        val d = s.current ?: return
+        if (d.revealed || s.submitted) return
+        if (s.currentType == QuestionType.MULTIPLE) {
+            val now = d.my.split("|").filter { it.isNotBlank() }
+            val next = (if (key in now) now - key else now + key).sorted()
+            persist(s.index, next, correct = null, revealed = false)
+        } else {
+            gradeAndPersist(s.index, listOf(key))
         }
     }
 
-    fun input(text: String) {
+    fun input(text: String) = _state.update { it.copy(input = text) }
+
+    /** 多选/填空题的「提交答案」。 */
+    fun submitAnswer() {
         val s = _state.value
-        if (s.submitted) return
-        _state.update { it.copy(texts = it.texts + (s.index to text)) }
+        val d = s.current ?: return
+        if (d.revealed || s.submitted) return
+        val my = when (s.currentType) {
+            QuestionType.MULTIPLE -> if (s.input.isNotBlank()) split(s.input)
+            else d.my.split("|").filter { it.isNotBlank() }
+            QuestionType.BLANK -> split(s.input)
+            else -> emptyList()
+        }
+        if (my.isEmpty()) return
+        gradeAndPersist(s.index, my)
     }
+
+    /** 不会做，直接看答案（主观题也走这里）。 */
+    fun reveal() {
+        val s = _state.value
+        val d = s.current ?: return
+        if (d.revealed || s.submitted) return
+        persist(s.index, emptyList(), correct = null, revealed = true)
+    }
+
+    /** 主观题自评。 */
+    fun selfGrade(correct: Boolean) {
+        val s = _state.value
+        val updated = s.record?.withSelfGrade(s.index, correct) ?: return
+        _state.update { it.copy(record = updated, input = "") }
+        saveAsync(updated)
+    }
+
+    /** 成绩单里对某一题自评。 */
+    fun selfGradeAt(index: Int, correct: Boolean) {
+        val s = _state.value
+        val updated = s.record?.withSelfGrade(index, correct) ?: return
+        _state.update { it.copy(record = updated) }
+        saveAsync(updated)
+    }
+
+    private fun gradeAndPersist(index: Int, my: List<String>) {
+        val d = _state.value.details.getOrNull(index) ?: return
+        val correct = AnswerJudge.isCorrect(questionOf(d), my)
+        persist(index, my, correct, revealed = true)
+    }
+
+    /** 改内存状态 + 立即落本地库（实时记录考试进度），再按节流同步云端。 */
+    private fun persist(index: Int, my: List<String>, correct: Boolean?, revealed: Boolean) {
+        val s = _state.value
+        val record = s.record ?: return
+        val updated = record.withAnswer(index, my, correct, revealed, s.index)
+        _state.update { it.copy(record = updated, input = "") }
+        saveAsync(updated)
+        scheduleCloudSync()
+    }
+
+    private fun saveAsync(record: ExamRecord) {
+        viewModelScope.launch { withContext(Dispatchers.IO) { container.exams.saveLocal(record) } }
+    }
+
+    // ------------------------------------------------------- 云端同步（节流）
+
+    private var lastCloudSyncAt = 0L
+    private var syncJob: Job? = null
+
+    private fun canSyncToCloud(): Boolean {
+        val settings = container.settings.current()
+        return settings.loggedIn && settings.autoUploadScore && container.exams.hasUploadTarget()
+    }
+
+    /**
+     * 把「进行中」的考试同步到云端。
+     *
+     * 本地一定是先写好的，所以这里**失败也不影响答题**，只更新一个状态文字，
+     * 下次作答会再试；并且节流（最快 [SYNC_THROTTLE_MS] 一次），避免每答一题都打网络。
+     */
+    private fun scheduleCloudSync(force: Boolean = false) {
+        if (_state.value.submitted || !canSyncToCloud()) return
+        if (syncJob?.isActive == true && !force) return
+        val wait = if (force) 0L
+        else (SYNC_THROTTLE_MS - (System.currentTimeMillis() - lastCloudSyncAt)).coerceAtLeast(0L)
+        syncJob = viewModelScope.launch {
+            if (wait > 0) delay(wait)
+            doCloudSync()
+        }
+    }
+
+    private suspend fun doCloudSync() {
+        val record = _state.value.record ?: return
+        if (record.localId <= 0L) return
+        lastCloudSyncAt = System.currentTimeMillis()
+        runCatching { container.exams.upload(record) }
+            .onSuccess { path ->
+                _state.update {
+                    it.copy(
+                        cloudState = "已同步到云端",
+                        record = it.record?.copy(uploaded = true, remotePath = path),
+                    )
+                }
+            }
+            .onFailure {
+                _state.update { it.copy(cloudState = "云端同步失败，答题不受影响，稍后自动重试") }
+            }
+    }
+
+    /** 离开页面时补一次，确保最后的状态落地（用 appScope，页面销毁也能跑完）。 */
+    fun flushCloudSync() {
+        if (_state.value.submitted || !canSyncToCloud()) return
+        val record = _state.value.record ?: return
+        if (record.localId <= 0L) return
+        container.appScope.launch { runCatching { container.exams.upload(record) } }
+    }
+
+    // ------------------------------------------------------------ 导航
 
     fun next() {
         val s = _state.value
-        if (s.index < s.totalQuestions - 1) _state.update { it.copy(index = s.index + 1) }
+        if (s.index >= s.totalQuestions - 1) return
+        goto(s.index + 1)
     }
 
     fun prev() {
         val s = _state.value
-        if (s.index > 0) _state.update { it.copy(index = s.index - 1) }
+        if (s.index <= 0) return
+        goto(s.index - 1)
     }
 
     fun goto(index: Int) {
         val s = _state.value
-        if (index in 0 until s.totalQuestions) {
-            _state.update { it.copy(index = index, reviewIndex = null) }
-        }
+        if (index !in s.details.indices) return
+        _state.update { it.copy(index = index, input = "", reviewIndex = null) }
+        s.record?.let { saveAsync(it.copy(index = index)) }
+        scheduleCloudSync()
     }
 
     // ------------------------------------------------------------ 交卷
 
     fun submit() {
         val s = _state.value
-        val paper = s.paper ?: return
+        val record = s.record ?: return
         if (s.submitted) return
         viewModelScope.launch {
             _state.update { it.copy(busy = true) }
-            val finishedAt = System.currentTimeMillis()
-            val results = paper.items.mapIndexed { index, item ->
-                index to grade(item.question, s.choices[index], s.texts[index])
-            }.toMap()
-            val userAnswers = paper.items.indices.associateWith { index ->
-                s.choices[index] ?: s.texts[index]?.takeIf { it.isNotBlank() }?.let { splitText(it) } ?: emptyList()
+            val finished = record.copy(index = s.index).finish(System.currentTimeMillis())
+            withContext(Dispatchers.IO) { container.exams.saveLocal(finished) }
+            _state.update { it.copy(busy = false, submitted = true, record = finished) }
+            if (canSyncToCloud()) {
+                upload()
+                // 交卷后文件名变了，把旧的「进行中」文件从云端清掉
+                if (record.remotePath.isNotBlank()) {
+                    withContext(Dispatchers.IO) { container.exams.removeRemote(record.remotePath) }
+                }
             }
-            val settings = container.settings.current()
-            val record = ExamRecord.from(
-                paper = paper,
-                results = results,
-                userAnswers = userAnswers,
-                meta = ExamMeta(
-                    user = settings.effectiveName,
-                    bankId = bankId,
-                    bankName = s.bank?.name.orEmpty(),
-                    bankKey = s.bank?.remoteId?.ifBlank { s.bank?.fileUrl.orEmpty() }.orEmpty(),
-                    category = s.bank?.category.orEmpty(),
-                    startedAt = startedAt,
-                    finishedAt = finishedAt,
-                    device = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
-                ),
-            )
-            val id = withContext(Dispatchers.IO) { container.exams.saveLocal(record) }
-            val saved = record.copy(localId = id)
-            _state.update {
-                it.copy(
-                    busy = false,
-                    submitted = true,
-                    record = saved,
-                    result = ExamBuilder.score(paper, results),
-                )
-            }
-            if (settings.autoUploadScore && container.exams.hasUploadTarget()) upload()
-        }
-    }
-
-    private fun grade(question: Question, choice: List<String>?, text: String?): Boolean? = when (question.type) {
-        QuestionType.ESSAY -> null
-        QuestionType.BLANK -> {
-            val answers = text?.takeIf { it.isNotBlank() }?.let { splitText(it) }
-            if (answers.isNullOrEmpty()) false else AnswerJudge.isCorrect(question, answers)
-        }
-        else -> AnswerJudge.isCorrect(question, choice.orEmpty())
-    }
-
-    private fun splitText(text: String): List<String> =
-        text.split('|', '｜', ';', '；', ',').map { it.trim() }.filter { it.isNotEmpty() }
-
-    /** 主观题自评：改分并更新本地记录。 */
-    fun selfGrade(index: Int, correct: Boolean) {
-        val s = _state.value
-        val record = s.record ?: return
-        val paper = s.paper ?: return
-        if (index !in record.details.indices) return
-        viewModelScope.launch {
-            val details = record.details.toMutableList()
-            details[index] = details[index].copy(correct = correct)
-            val scored = paper.items.indices.sumOf { i ->
-                val ok = details.getOrNull(i)?.correct == true
-                if (ok) paper.items[i].score else 0
-            }
-            val correctCount = details.count { it.correct == true }
-            val wrongCount = details.count { it.correct == false }
-            val selfGraded = details.count { it.correct == null }
-            val total = record.totalPoints
-            val updated = record.copy(
-                details = details,
-                scoredPoints = scored,
-                percent = if (total <= 0) 0 else (scored * 100 + total / 2) / total,
-                correctCount = correctCount,
-                wrongCount = wrongCount,
-                selfGraded = selfGraded,
-                uploaded = false, // 分数变了，需要重新上传
-            )
-            withContext(Dispatchers.IO) { container.exams.saveLocal(updated) }
-            _state.update { it.copy(record = updated) }
         }
     }
 
     fun upload() {
         val record = _state.value.record ?: return
+        if (record.localId <= 0L) return
         viewModelScope.launch {
             _state.update { it.copy(uploadState = "正在上传考试记录…") }
             val local = withContext(Dispatchers.IO) { container.exams.record(record.localId) } ?: record
@@ -321,6 +453,7 @@ class ExamViewModel(
 
     fun openReview(index: Int?) = _state.update { it.copy(reviewIndex = index) }
 }
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -406,7 +539,7 @@ fun ExamScreen(container: AppContainer, nav: NavController, bankId: Long) {
                 )
                 state.submitted -> ExamReport(
                     state = state,
-                    onSelfGrade = vm::selfGrade,
+                    onSelfGrade = vm::selfGradeAt,
                     onUpload = vm::upload,
                     onFinish = { nav.popBackStack() },
                     onReview = { vm.openReview(it) },
@@ -498,11 +631,10 @@ private fun ExamPager(state: ExamViewModel.UiState, vm: ExamViewModel) {
 /** 单页考题。只有当前页可作答，相邻页从各自的作答记录里还原选中状态。 */
 @Composable
 private fun ExamQuestion(state: ExamViewModel.UiState, vm: ExamViewModel, index: Int) {
-    val item = state.paper?.items?.getOrNull(index) ?: return
-    val question = item.question
+    val d = state.details.getOrNull(index) ?: return
     val isCurrent = index == state.index
-    val selected = state.choices[index].orEmpty()
-    val text = state.texts[index].orEmpty()
+    val type = QuestionType.fromText(d.type) ?: QuestionType.SINGLE
+    val picked = d.my.split("|").filter { it.isNotBlank() }
     val imageBase = state.bank?.imageBase.orEmpty()
 
     Column(
@@ -513,52 +645,98 @@ private fun ExamQuestion(state: ExamViewModel.UiState, vm: ExamViewModel, index:
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TypeChip(question.type)
+            TypeChip(type)
             Text(
-                "第 ${index + 1} 题 · ${item.score} 分",
+                "第 ${index + 1} 题 · ${d.score} 分",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.weight(1f))
-            if (!isCurrent) {
-                // 相邻页给个提示，避免以为点不动是坏了
+            if (d.revealed) {
                 Text(
-                    "滑动或点「下一题」回到这题作答",
+                    when (d.correct) {
+                        true -> "已答对"
+                        false -> "已答错"
+                        null -> "已看答案"
+                    },
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = when (d.correct) {
+                        true -> Color(0xFF16A34A)
+                        false -> MaterialTheme.colorScheme.error
+                        null -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                 )
             }
         }
 
-        RichTextView(raw = question.stem, imageBase = imageBase)
+        RichTextView(raw = d.stem, imageBase = imageBase)
 
         when {
-            question.options.isNotEmpty() -> question.options.forEach { option ->
+            d.optionKeys.isNotEmpty() -> d.optionKeys.forEachIndexed { i, key ->
                 ExamOptionRow(
-                    key = option.key,
-                    text = option.text,
+                    key = key,
+                    text = d.options.getOrNull(i).orEmpty(),
                     imageBase = imageBase,
-                    selected = option.key in selected,
-                    multi = question.type == QuestionType.MULTIPLE,
-                    onClick = { if (isCurrent) vm.choose(option.key) },
+                    selected = key in picked,
+                    revealed = d.revealed,
+                    isCorrectOption = key in d.answerKeys,
+                    multi = type == QuestionType.MULTIPLE,
+                    onClick = { if (isCurrent) vm.choose(key) },
                 )
             }
-            question.type == QuestionType.BLANK -> OutlinedTextField(
-                value = text,
+            type == QuestionType.BLANK -> OutlinedTextField(
+                value = if (isCurrent) state.input else picked.joinToString("|"),
                 onValueChange = { if (isCurrent) vm.input(it) },
-                enabled = isCurrent,
-                label = { Text(if (question.answers.size > 1) "多个空用 | 分隔" else "填写答案") },
+                enabled = isCurrent && !d.revealed,
+                label = { Text(if (d.answerKeys.size > 1) "多个空用 | 分隔" else "填写答案") },
                 modifier = Modifier.fillMaxWidth(),
                 keyboardOptions = KeyboardOptions.Default,
             )
             else -> OutlinedTextField(
-                value = text,
+                value = if (isCurrent) state.input else d.my,
                 onValueChange = { if (isCurrent) vm.input(it) },
-                enabled = isCurrent,
-                label = { Text("作答（主观题交卷后自评）") },
+                enabled = isCurrent && !d.revealed,
+                label = { Text("作答（点「看答案」后自评）") },
                 minLines = 3,
                 modifier = Modifier.fillMaxWidth(),
             )
+        }
+
+        // 即时反馈：判完就地把答案和解析显示出来
+        if (d.revealed) {
+            SectionCard {
+                Text(
+                    when (d.correct) {
+                        true -> "回答正确"
+                        false -> "回答错误"
+                        null -> "参考答案"
+                    },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = when (d.correct) {
+                        true -> Color(0xFF16A34A)
+                        false -> MaterialTheme.colorScheme.error
+                        null -> MaterialTheme.colorScheme.onSurface
+                    },
+                )
+                Spacer(Modifier.height(4.dp))
+                Text("正确答案：${d.answer}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                if (d.correct == null && type == QuestionType.ESSAY && isCurrent) {
+                    Spacer(Modifier.height(10.dp))
+                    Text("主观题请自行对照参考答案评分：", style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { vm.selfGrade(true) }, modifier = Modifier.weight(1f)) { Text("我答对了") }
+                        OutlinedButton(onClick = { vm.selfGrade(false) }, modifier = Modifier.weight(1f)) { Text("我答错了") }
+                    }
+                }
+                if (d.analysis.isNotBlank()) {
+                    Spacer(Modifier.height(10.dp))
+                    Text("解析", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(4.dp))
+                    RichTextView(raw = d.analysis, imageBase = imageBase)
+                }
+            }
         }
         Spacer(Modifier.height(24.dp))
     }
@@ -571,17 +749,29 @@ private fun ExamOptionRow(
     imageBase: String,
     selected: Boolean,
     multi: Boolean,
+    revealed: Boolean = false,
+    isCorrectOption: Boolean = false,
     onClick: () -> Unit,
 ) {
-    val borderColor = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+    val okColor = Color(0xFF16A34A)
+    val borderColor = when {
+        revealed && isCorrectOption -> okColor
+        revealed && selected -> MaterialTheme.colorScheme.error
+        selected -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+    }
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .border(1.5.dp, borderColor, RoundedCornerShape(10.dp))
             .clickable(onClick = onClick),
         colors = CardDefaults.cardColors(
-            containerColor = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
-            else MaterialTheme.colorScheme.surface,
+            containerColor = when {
+                revealed && isCorrectOption -> okColor.copy(alpha = 0.12f)
+                revealed && selected -> MaterialTheme.colorScheme.error.copy(alpha = 0.10f)
+                selected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
+                else -> MaterialTheme.colorScheme.surface
+            },
         ),
         shape = RoundedCornerShape(10.dp),
     ) {
@@ -590,7 +780,14 @@ private fun ExamOptionRow(
                 Modifier
                     .size(24.dp)
                     .clip(if (multi) RoundedCornerShape(6.dp) else CircleShape)
-                    .background(if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant),
+                    .background(
+                        when {
+                            revealed && isCorrectOption -> okColor
+                            revealed && selected -> MaterialTheme.colorScheme.error
+                            selected -> MaterialTheme.colorScheme.primary
+                            else -> MaterialTheme.colorScheme.surfaceVariant
+                        }
+                    ),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
@@ -627,8 +824,7 @@ private fun ExamAnswerCard(
                 (0 until state.totalQuestions).chunked(6).forEach { row ->
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         row.forEach { index ->
-                            val answered = state.choices.containsKey(index) ||
-                                !state.texts[index].isNullOrBlank()
+                            val answered = state.details.getOrNull(index)?.my?.isNotBlank() == true
                             Box(
                                 Modifier
                                     .size(38.dp)
@@ -787,8 +983,12 @@ private fun ExamReport(
                     if (expanded) {
                         Spacer(Modifier.height(8.dp))
                         RichTextView(raw = detail.stem, imageBase = state.bank?.imageBase.orEmpty())
-                        detail.options.forEach { option ->
-                            Text(option, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 2.dp))
+                        detail.options.forEachIndexed { i, option ->
+                            Text(
+                                "${detail.optionKeys.getOrNull(i)?.let { "$it. " }.orEmpty()}$option",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
                         }
                         Spacer(Modifier.height(6.dp))
                         Text("我的作答：${detail.my.ifBlank { "（未作答）" }}", style = MaterialTheme.typography.bodySmall)

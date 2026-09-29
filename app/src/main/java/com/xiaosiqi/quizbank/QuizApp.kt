@@ -34,6 +34,11 @@ class AppContainer(context: Context) {
 
     val exams: ExamRepository = ExamRepository(store, settings) { session.authorized() }
 
+    /** 当前安装的版本号（用于和 GitHub Releases 比） */
+    val appVersion: String = BuildConfig.VERSION_NAME
+
+    val updates: com.xiaosiqi.quizbank.update.UpdateChecker = com.xiaosiqi.quizbank.update.UpdateChecker()
+
     val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     init {

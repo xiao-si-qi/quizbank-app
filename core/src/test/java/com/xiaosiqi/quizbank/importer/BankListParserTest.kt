@@ -92,4 +92,24 @@ class BankListParserTest {
         )
         assertEquals(1, BankListParser.parse(table).items.size)
     }
+    @Test
+    fun `题库名里的百分号编码会被解回中文`() {
+        val header = listOf("题库名称", "文件地址")
+        val rows = listOf(
+            header,
+            // 名称列直接粘了编码过的文件名
+            listOf("%E8%AE%A1%E7%AE%97%E6%9C%BA%E5%9F%BA%E7%A1%80.xlsx", "/题库/公开/计算机基础.xlsx"),
+            // 名称列是空 → 从地址推，地址本身是编码的
+            listOf("", "/题库/%E5%86%85%E9%83%A8/%E4%BF%A1%E5%8F%B7%E5%B7%A5-2017.csv"),
+            // 正常中文名不受影响
+            listOf("消防安全（内部）", "/题库/内部/消防安全-内部.xlsx"),
+            // 名称列粘的是完整路径
+            listOf("/题库/内部/信号工-2016高级工复习题.csv", "/题库/内部/信号工-2016高级工复习题.csv"),
+        )
+        val items = BankListParser.parse(com.xiaosiqi.quizbank.excel.SheetTable("题库列表", rows)).items
+        assertEquals("计算机基础", items[0].name)
+        assertEquals("信号工-2017", items[1].name)
+        assertEquals("消防安全（内部）", items[2].name)
+        assertEquals("信号工-2016高级工复习题", items[3].name)
+    }
 }

@@ -415,13 +415,13 @@ fun SettingsScreen(container: AppContainer, nav: NavController) {
                     )
                     Spacer(Modifier.height(10.dp))
                     SwitchRow(
-                        title = "考试结束后自动上传考试记录",
+                        title = "自动同步考试记录到云端",
                         checked = settings.autoUploadScore,
                         onCheckedChange = { v -> vm.update { it.copy(autoUploadScore = v) } },
                     )
                     Text(
-                        "普通练习不会上传，也不生成成绩；只有「考试模式」的成绩才会存下来并上传。" +
-                            "每条记录都带逐题作答，管理员可据此回顾每道题。",
+                        "登录后默认开启：考试过程中会节流同步（换手机也能接着考），交卷后再同步一次。" +
+                            "普通练习不上传、也不生成成绩。每条记录都带逐题作答，管理员可据此回顾每道题。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

@@ -36,6 +36,24 @@ object TextNorm {
     }
 
     /** 单行紧凑化：所有空白折叠成一个空格，用于选项文本。 */
+    /**
+     * 显示用的名字：把百分号编码解回中文。
+     *
+     * 题库清单里如果没写「题库名称」，我们会从文件地址推名字；
+     * 而地址常常是 `.../%E4%BF%A1%E5%8F%B7%E5%B7%A5.xlsx` 这种带百分号编码的形式，
+     * 直接取最后一段就会显示成乱码，所以这里统一解一次。
+     * 只有看起来确实是编码过的才解，正常中文名原样返回。
+     */
+    fun displayName(raw: String): String {
+        val text = raw.trim()
+        if (text.isEmpty()) return text
+        if (!Regex("%[0-9A-Fa-f]{2}").containsMatchIn(text)) return text
+        return runCatching {
+            // '+' 在文件名里是普通字符，先保护起来再解码
+            java.net.URLDecoder.decode(text.replace("+", "%2B"), "UTF-8")
+        }.getOrDefault(text)
+    }
+
     fun oneLine(raw: String): String = value(raw).replace(Regex("\\s+"), " ").trim()
 
     /** 宽松比较用：去掉全部空白与常见分隔标点后小写。 */

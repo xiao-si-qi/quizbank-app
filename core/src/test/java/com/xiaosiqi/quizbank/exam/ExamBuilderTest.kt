@@ -237,7 +237,11 @@ class ExamBuilderTest {
         assertEquals("A", first.my)
         assertTrue(first.stem.isNotBlank())
         assertEquals(4, first.options.size)
-        assertEquals("A. 选项0", first.options[0])
+        // 选项文本与字母分开存：文本用于展示/续考重建，字母用于判分
+        assertEquals("选项0", first.options[0])
+        assertEquals(listOf("A", "B", "C", "D"), first.optionKeys)
+        assertEquals(listOf("A"), first.answerKeys)
+        assertEquals("A. 选项0", "${first.optionKeys[0]}. ${first.options[0]}")
         assertEquals(false, record.details[1].correct)
     }
 

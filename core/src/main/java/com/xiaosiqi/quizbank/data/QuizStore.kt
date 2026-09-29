@@ -94,6 +94,9 @@ interface QuizStore {
 
     fun exam(localId: Long): ExamRecord?
 
+    /** 某个题库还没交卷的那场考试（用来「继续考试」）。 */
+    fun inProgressExam(bankId: Long): ExamRecord?
+
     fun deleteExam(localId: Long)
 
     fun markExamUploaded(localId: Long, remotePath: String)

@@ -37,11 +37,19 @@ data class AppSettings(
     // ---- 成绩 ----
     /** 成绩上传到 alist 的目录，例如 /题库/成绩/张三。 */
     val scoreUploadPath: String = "",
-    /** 考试结束后自动上传考试记录（普通练习不上传）。 */
-    val autoUploadScore: Boolean = false,
+    /**
+     * 自动把考试记录同步到云端。
+     * **默认开启**：登录用户在考试过程中就会节流同步（可跨设备续考），交卷后立即同步一次。
+     * 普通练习不产生成绩，自然也不上传。
+     */
+    val autoUploadScore: Boolean = true,
     val displayName: String = "",
     /** 是否允许管理员查看所有人的考试记录。 */
     val allowAdminOverview: Boolean = true,
+    /** 上次自动检查更新的时间（一天只自动查一次） */
+    val lastUpdateCheckAt: Long = 0L,
+    /** 用户点了「跳过此版本」的版本号 */
+    val skippedVersion: String = "",
 
     // ---- 普通用户的开箱即用策略 ----
     /** 题库列表地址与成绩目录是否跟随登录状态自动设置（用户手动改过就关掉）。 */

@@ -65,8 +65,10 @@ object BankListParser {
             if (url.isBlank()) continue
             if (!seen.add(url.lowercase())) { duplicates++; continue }
 
-            val name = nameCol?.let { TextNorm.oneLine(row.getOrElse(it) { "" }) }.orEmpty()
-                .ifBlank { nameFromUrl(url) }
+            val name = resolveName(
+                nameCol?.let { TextNorm.oneLine(row.getOrElse(it) { "" }) }.orEmpty(),
+                url,
+            )
 
             items.add(
                 BankListItem(
@@ -123,9 +125,25 @@ object BankListParser {
         )
     }
 
+    /**
+     * 决定题库显示名。
+     *
+     * 题库名可能在「题库名称」列里，也可能是从文件地址推出来的。
+     * 这两种情况都可能带**百分号编码**（作者直接把地址粘进名称列时尤其常见），
+     * 所以这里统一：解码 → 只取文件名 → 去掉扩展名。解不出就把原文还给用户。
+     */
+    private fun resolveName(rawName: String, url: String): String {
+        val decoded = TextNorm.displayName(rawName)
+        val base = if (decoded.contains('/')) decoded.substringAfterLast('/') else decoded
+        val noExt = base.replace(Regex("\\.(xlsx|xls|csv|et|XLSX|XLS|CSV)$"), "")
+        return noExt.trim().ifBlank { nameFromUrl(url) }
+    }
+
     fun nameFromUrl(url: String): String {
         val clean = url.substringBefore('?').trimEnd('/')
-        val file = clean.substringAfterLast('/')
-        return file.substringBeforeLast('.').ifBlank { clean }
+        // 地址里常见百分号编码，先解码再取名字，否则会显示成 %E4%BF%A1… 这种乱码
+        val decoded = TextNorm.displayName(clean)
+        val file = decoded.substringAfterLast('/')
+        return file.substringBeforeLast('.').ifBlank { decoded }.ifBlank { clean }
     }
 }

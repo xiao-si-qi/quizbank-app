@@ -31,11 +31,15 @@ class ExamRepository(
 
     fun record(localId: Long): ExamRecord? = store.exam(localId)
 
-    fun localSummary(limit: Int = 500): ExamSummary = ExamSummary.of(store.exams(limit))
+    /** 这个题库有没有没交卷的考试。 */
+    fun inProgress(bankId: Long): ExamRecord? = store.inProgressExam(bankId)
+
+    fun localSummary(limit: Int = 500): ExamSummary = ExamSummary.of(store.exams(limit).filter { !it.inProgress })
 
     fun deleteLocal(localId: Long) = store.deleteExam(localId)
 
-    fun pending(): List<ExamRecord> = store.exams(1000).filter { !it.uploaded }
+    /** 可以上传的：只有交过卷的。进行中的考试不上传。 */
+    fun pending(): List<ExamRecord> = store.exams(1000).filter { !it.uploaded && !it.inProgress }
 
     // ------------------------------------------------------------ 远端目录
 
@@ -55,6 +59,7 @@ class ExamRepository(
 
     /** 上传一次考试成绩（始终带逐题明细，管理员才能回顾每道题）。 */
     suspend fun upload(record: ExamRecord): String {
+        if (record.inProgress) throw ExamException("这场考试还没交卷，交卷后才能上传成绩。")
         val root = scoreRoot()
         if (root.isEmpty()) {
             throw ExamException("还没有设置「考试记录上传目录」。\n请到「设置 → 考试记录」里填写 alist 上的目标目录。")
@@ -66,6 +71,41 @@ class ExamRepository(
         client.uploadText(path, ExamJson.encode(record))
         if (record.localId > 0) store.markExamUploaded(record.localId, path)
         return path
+    }
+
+    /** 删掉云端某个文件（交卷后清理掉旧的「进行中」文件）。 */
+    suspend fun removeRemote(path: String) {
+        if (path.isBlank()) return
+        runCatching { clientProvider().remove(path) }
+    }
+
+    /**
+     * 找这个题库在云端**进行中**的那场考试（跨设备续考用）。
+     *
+     * 只下载文件名以 `inprogress_<题库id>_` 开头的那一两个文件，
+     * 不会把账号下所有成绩都拉一遍。
+     */
+    suspend fun findInProgress(bankId: Long, maxFiles: Int = 20): ExamRecord? {
+        val dir = myDir()
+        if (dir.isBlank()) return null
+        val client = clientProvider()
+        val prefix = ExamRecord.inProgressPrefix(bankId)
+        val candidates = runCatching { client.list(dir) }
+            .getOrNull()
+            .orEmpty()
+            .filter { !it.isDir && it.name.startsWith(prefix) && it.name.endsWith(".json", true) }
+            .sortedByDescending { it.name }
+            .take(maxFiles)
+        var best: ExamRecord? = null
+        for (item in candidates) {
+            val path = "$dir/${item.name}".replace("//", "/")
+            val record = runCatching {
+                ExamJson.decode(String(client.download(FileRef.AlistPath(path)).bytes, Charsets.UTF_8))
+                    .copy(remotePath = path, uploaded = true)
+            }.getOrNull() ?: continue
+            if (record.inProgress && (best == null || record.updatedAt > best.updatedAt)) best = record
+        }
+        return best
     }
 
     suspend fun uploadAllPending(): Pair<Int, List<String>> {

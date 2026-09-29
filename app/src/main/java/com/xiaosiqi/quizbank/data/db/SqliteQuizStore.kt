@@ -63,6 +63,12 @@ class SqliteQuizStore(context: Context) : QuizStore {
                 )
                 db.execSQL("CREATE INDEX idx_exams_created ON exams(created_at)")
             }
+            // v2 -> v3：考试记录区分「进行中/已交卷」，支持中途退出后继续考
+            if (oldVersion < 3 && oldVersion >= 1) {
+                runCatching {
+                    db.execSQL("ALTER TABLE exams ADD COLUMN status TEXT NOT NULL DEFAULT 'FINISHED'")
+                }
+            }
         }
     }
 
@@ -523,6 +529,7 @@ class SqliteQuizStore(context: Context) : QuizStore {
             put("data", ExamJson.encode(record))
             put("bank_id", record.bankId)
             put("user_name", record.user)
+            put("status", record.status)
             put("uploaded", if (record.uploaded) 1 else 0)
             put("remote_path", record.remotePath)
             put("created_at", if (record.finishedAt > 0) record.finishedAt else System.currentTimeMillis())
@@ -543,6 +550,12 @@ class SqliteQuizStore(context: Context) : QuizStore {
         read.rawQuery("SELECT * FROM exams WHERE id=?", arrayOf(localId.toString())).use { c ->
             if (c.moveToFirst()) readExam(c) else null
         }
+
+    override fun inProgressExam(bankId: Long): ExamRecord? =
+        read.rawQuery(
+            "SELECT * FROM exams WHERE bank_id=? AND status=? ORDER BY created_at DESC LIMIT 1",
+            arrayOf(bankId.toString(), ExamRecord.STATUS_IN_PROGRESS),
+        ).use { c -> if (c.moveToFirst()) readExam(c) else null }
 
     override fun deleteExam(localId: Long) {
         write.delete("exams", "id=?", arrayOf(localId.toString()))
@@ -618,7 +631,7 @@ class SqliteQuizStore(context: Context) : QuizStore {
 
     private companion object {
         const val DB_NAME = "quizbank.db"
-        const val DB_VERSION = 2
+        const val DB_VERSION = 3
 
         const val INSERT_QUESTION =
             "INSERT INTO questions(bank_id,order_index,qtype,stem,options,answers,analysis,difficulty,chapter,tags,score,source_row) " +
@@ -708,6 +721,7 @@ class SqliteQuizStore(context: Context) : QuizStore {
               data TEXT NOT NULL DEFAULT '',
               bank_id INTEGER NOT NULL DEFAULT 0,
               user_name TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'FINISHED',
               uploaded INTEGER NOT NULL DEFAULT 0,
               remote_path TEXT NOT NULL DEFAULT '',
               created_at INTEGER NOT NULL DEFAULT 0

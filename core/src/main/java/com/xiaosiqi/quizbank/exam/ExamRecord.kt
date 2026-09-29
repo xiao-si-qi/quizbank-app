@@ -30,8 +30,14 @@ data class ExamDetail(
     val answer: String = "",
     val stem: String = "",
     val analysis: String = "",
-    /** 选项文本，按 A/B/C… 顺序 */
+    /** 选项文本（不含字母前缀），顺序与 [optionKeys] 对应 */
     val options: List<String> = emptyList(),
+    /** 选项字母，如 [A, B, C, D]；续考时靠它重建题目 */
+    val optionKeys: List<String> = emptyList(),
+    /** 正确答案（判分用）：选择题是字母，填空题是答案文本 */
+    val answerKeys: List<String> = emptyList(),
+    /** 是否已经看过答案（没作答也可能看过） */
+    val revealed: Boolean = false,
 )
 
 /** 构造一次考试记录所需的外部信息。 */
@@ -54,6 +60,12 @@ data class ExamMeta(
 @Serializable
 data class ExamRecord(
     val schema: Int = 2,
+    /** IN_PROGRESS = 还没交卷，可以从考试记录里接着考 */
+    val status: String = STATUS_FINISHED,
+    /** 上次做到第几题（0 基），续考用 */
+    val index: Int = 0,
+    /** 最后一次改动时间：多设备续考时用它判断谁更新 */
+    val updatedAt: Long = 0L,
     val app: String = "QuizBank",
     val appVersion: String = "1.0.0",
     val kind: String = KIND_EXAM,
@@ -83,6 +95,9 @@ data class ExamRecord(
     @Transient val remotePath: String = "",
     @Transient val uploaded: Boolean = false,
 ) {
+    /** 还没交卷 */
+    val inProgress: Boolean get() = status == STATUS_IN_PROGRESS
+
     val durationText: String
         get() {
             val m = durationSec / 60
@@ -90,7 +105,17 @@ data class ExamRecord(
             return if (m > 0) "${m}分${s}秒" else "${s}秒"
         }
 
+    /**
+     * 云端文件名。
+     *
+     * 进行中的考试用 `inprogress_<题库id>_<开始时间>.json`：
+     * 换一台手机时只要按前缀找，就能定位到「这场考试的续考文件」，
+     * 不用把账号下所有成绩都下载一遍。
+     */
     fun fileName(): String {
+        if (inProgress) {
+            return "inprogress_${bankId}_${if (startedAt > 0) startedAt else System.currentTimeMillis()}.json"
+        }
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
             .format(Date(if (finishedAt > 0) finishedAt else System.currentTimeMillis()))
         val safeUser = user.safeSegment().take(20).ifBlank { "匿名" }
@@ -98,8 +123,14 @@ data class ExamRecord(
         return "${stamp}_${safeUser}_${safeBank}.json"
     }
 
+
     companion object {
         const val KIND_EXAM = "EXAM"
+        const val STATUS_IN_PROGRESS = "IN_PROGRESS"
+        const val STATUS_FINISHED = "FINISHED"
+
+        /** 「进行中」文件名的固定前缀（按题库区分）。 */
+        fun inProgressPrefix(bankId: Long): String = "inprogress_${bankId}_"
 
         private fun String.safeSegment(): String = trim().map { ch ->
             when {
@@ -109,7 +140,50 @@ data class ExamRecord(
             }
         }.joinToString("").replace(Regex("_+"), "_").trim('_')
 
-        /** 把一套卷子 + 作答结果整理成可保存/可上传的记录。 */
+        /** 从卷子里取一题，填成记录条目。[results]/[userAnswers] 传空就是「还没考」。 */
+        private fun detailOf(
+            index: Int,
+            item: ExamItem,
+            correct: Boolean?,
+            my: List<String>,
+            revealed: Boolean,
+        ) = ExamDetail(
+            index = index + 1,
+            type = item.question.type.label,
+            score = item.score,
+            correct = correct,
+            my = my.joinToString("|"),
+            answer = item.question.answerText(),
+            stem = item.question.stem,
+            analysis = item.question.analysis,
+            options = item.question.options.map { it.text },
+            optionKeys = item.question.options.map { it.key },
+            answerKeys = item.question.answers,
+            revealed = revealed,
+        )
+
+        /**
+         * 点「考试」的那一刻就建一条**进行中**的记录：
+         * 抽好的题 + 每题分值都存进去，这样中途退出还能接着考。
+         */
+        fun start(paper: ExamPaper, meta: ExamMeta): ExamRecord = ExamRecord(
+            status = STATUS_IN_PROGRESS,
+            appVersion = meta.appVersion,
+            user = meta.user,
+            bankId = meta.bankId,
+            bankName = meta.bankName,
+            bankKey = meta.bankKey,
+            category = meta.category,
+            questionCount = paper.questionCount,
+            totalPoints = paper.totalPoints,
+            startedAt = meta.startedAt,
+            device = meta.device,
+            details = paper.items.mapIndexed { index, item ->
+                detailOf(index, item, correct = null, my = emptyList(), revealed = false)
+            },
+        )
+
+        /** 把一套卷子 + 作答结果整理成**已交卷**的记录。 */
         fun from(
             paper: ExamPaper,
             results: Map<Int, Boolean?>,
@@ -118,20 +192,17 @@ data class ExamRecord(
         ): ExamRecord {
             val summary = ExamBuilder.score(paper, results)
             val details = paper.items.mapIndexed { index, item ->
-                ExamDetail(
-                    index = index + 1,
-                    type = item.question.type.label,
-                    score = item.score,
+                detailOf(
+                    index = index,
+                    item = item,
                     correct = results[index],
-                    my = userAnswers[index]?.joinToString("|").orEmpty(),
-                    answer = item.question.answerText(),
-                    stem = item.question.stem,
-                    analysis = item.question.analysis,
-                    options = item.question.options.map { "${it.key}. ${it.text}" },
+                    my = userAnswers[index].orEmpty(),
+                    revealed = results[index] != null || !userAnswers[index].isNullOrEmpty(),
                 )
             }
             val duration = ((meta.finishedAt - meta.startedAt).coerceAtLeast(0) / 1000).toInt()
             return ExamRecord(
+                status = STATUS_FINISHED,
                 appVersion = meta.appVersion,
                 user = meta.user,
                 bankId = meta.bankId,
@@ -153,6 +224,64 @@ data class ExamRecord(
                 details = details,
             )
         }
+    }
+
+    // ------------------------------------------------------------ 续考
+
+    /**
+     * 边考边存：更新某一题的作答与判分结果，并记住当前做到第几题。
+     * 每次作答后调用一次，退出重进就能接着考。
+     */
+    fun withAnswer(
+        questionIndex: Int,
+        my: List<String>,
+        correct: Boolean?,
+        revealed: Boolean,
+        currentIndex: Int,
+    ): ExamRecord {
+        if (questionIndex !in details.indices) return this
+        val list = details.toMutableList()
+        list[questionIndex] = list[questionIndex].copy(
+            my = my.joinToString("|"),
+            correct = correct,
+            revealed = revealed,
+        )
+        return recount(details = list, currentIndex = currentIndex)
+    }
+
+    /** 主观题自评后重算。 */
+    fun withSelfGrade(questionIndex: Int, correct: Boolean): ExamRecord {
+        if (questionIndex !in details.indices) return this
+        val list = details.toMutableList()
+        list[questionIndex] = list[questionIndex].copy(correct = correct, revealed = true)
+        return recount(details = list, currentIndex = index)
+    }
+
+    /** 交卷。 */
+    fun finish(finishedAt: Long): ExamRecord = copy(
+        status = STATUS_FINISHED,
+        updatedAt = System.currentTimeMillis(),
+        finishedAt = finishedAt,
+        durationSec = if (startedAt > 0) ((finishedAt - startedAt).coerceAtLeast(0) / 1000).toInt() else durationSec,
+    )
+
+    private fun recount(details: List<ExamDetail>, currentIndex: Int): ExamRecord {
+        val answered = details.count { it.my.isNotBlank() }
+        val correctCount = details.count { it.correct == true }
+        val wrongCount = details.count { it.correct == false }
+        val pending = details.count { it.correct == null && it.revealed }
+        val scored = details.sumOf { if (it.correct == true) it.score else 0 }
+        return copy(
+            details = details,
+            index = currentIndex,
+            updatedAt = System.currentTimeMillis(),
+            answered = answered,
+            correctCount = correctCount,
+            wrongCount = wrongCount,
+            selfGraded = pending,
+            scoredPoints = scored,
+            percent = if (totalPoints <= 0) 0 else (scored * 100 + totalPoints / 2) / totalPoints,
+        )
     }
 }
 
