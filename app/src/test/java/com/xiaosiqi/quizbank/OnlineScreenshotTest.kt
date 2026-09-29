@@ -240,6 +240,11 @@ class OnlineScreenshotTest {
         composeRule.waitUntil(timeoutMillis = 30_000) {
             composeRule.onAllNodesWithText("本机考试概览").fetchSemanticsNodes().isNotEmpty()
         }
+        // 未登录：只应该有「本机记录」一个标签页
+        assertTrue("未登录应显示「本机记录」", has("本机记录"))
+        assertTrue("未登录不该显示「云端记录」", !has("云端记录"))
+        assertTrue("未登录不该显示「全部用户」", !has("全部用户"))
+        println("  未登录时考试记录只有「本机记录」一个标签页 ✓")
         composeRule.waitForIdle()
         shoot("07-考试记录列表.png")
 

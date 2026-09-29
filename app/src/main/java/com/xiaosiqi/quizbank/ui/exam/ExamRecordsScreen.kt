@@ -81,8 +81,15 @@ import java.util.Locale
  */
 class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
 
+    /** 三个视角。哪些可用取决于登录状态和是不是管理员。 */
+    enum class RecordTab(val title: String) {
+        LOCAL("本机记录"),
+        CLOUD("云端记录"),
+        ALL_USERS("全部用户"),
+    }
+
     data class UiState(
-        val tab: Int = 0,
+        val tab: RecordTab = RecordTab.LOCAL,
         val loading: Boolean = true,
         val busy: String? = null,
         val local: List<ExamRecord> = emptyList(),
@@ -90,14 +97,30 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
         val remote: List<ExamRecord> = emptyList(),
         val remoteSummary: ExamSummary = ExamSummary(),
         val users: List<ExamRepository.UserExams> = emptyList(),
+        /** 已经加载过的标签页（避免切来切去重复请求）。 */
+        val loadedTabs: Set<RecordTab> = emptySet(),
         val selectedUser: String? = null,
         val detail: ExamRecord? = null,
         val message: String? = null,
         val error: String? = null,
         val canUpload: Boolean = false,
+        val loggedIn: Boolean = false,
         val isAdmin: Boolean = false,
         val userName: String = "",
-    )
+    ) {
+        /**
+         * 实际显示的标签页：
+         * - 本机记录：谁都能看
+         * - 云端记录：**登录后**才有意义（要靠账号权限去 alist 读写）
+         * - 全部用户：**只有 alist 管理员**能看到别人的成绩
+         */
+        val availableTabs: List<RecordTab>
+            get() = buildList {
+                add(RecordTab.LOCAL)
+                if (loggedIn) add(RecordTab.CLOUD)
+                if (isAdmin) add(RecordTab.ALL_USERS)
+            }
+    }
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -115,23 +138,29 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                 Triple(list, ExamSummary.of(list), runCatching { container.session.me() }.getOrNull())
             }
             _state.update {
-                it.copy(
+                val next = it.copy(
                     loading = false,
                     local = records,
                     summary = summary,
                     canUpload = container.exams.hasUploadTarget(),
+                    loggedIn = settings.loggedIn,
                     isAdmin = account?.isAdmin == true,
                     userName = settings.effectiveName,
                 )
+                // 之前选中的标签页可能已经不适用（比如刚退出登录），回落到「本机记录」
+                if (next.tab in next.availableTabs) next else next.copy(tab = RecordTab.LOCAL)
             }
         }
     }
 
-    fun setTab(index: Int) {
-        _state.update { it.copy(tab = index) }
-        when (index) {
-            1 -> if (_state.value.remote.isEmpty()) loadRemote()
-            2 -> if (_state.value.users.isEmpty()) loadAllUsers()
+    fun setTab(tab: RecordTab) {
+        val s = _state.value
+        if (tab !in s.availableTabs) return      // 没资格看的标签页直接忽略
+        _state.update { it.copy(tab = tab) }
+        when (tab) {
+            RecordTab.CLOUD -> if (s.remote.isEmpty() && s.loadedTabs.none { it == RecordTab.CLOUD }) loadRemote()
+            RecordTab.ALL_USERS -> if (s.loadedTabs.none { it == RecordTab.ALL_USERS }) loadAllUsers()
+            RecordTab.LOCAL -> Unit
         }
     }
 
@@ -177,6 +206,7 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                 .onSuccess { result ->
                     _state.update {
                         it.copy(
+                            loadedTabs = it.loadedTabs + RecordTab.CLOUD,
                             loading = false,
                             remote = result.records,
                             remoteSummary = ExamSummary.of(result.records),
@@ -199,6 +229,7 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                 .onSuccess { users ->
                     _state.update {
                         it.copy(
+                            loadedTabs = it.loadedTabs + RecordTab.ALL_USERS,
                             loading = false,
                             users = users,
                             message = if (users.isEmpty()) "成绩目录下还没有任何用户的考试记录。" else null,
@@ -266,12 +297,13 @@ fun ExamRecordsScreen(container: AppContainer, nav: NavController) {
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            TabRow(selectedTabIndex = state.tab) {
-                listOf("本机记录", "云端记录", "全部用户").forEachIndexed { index, title ->
+            val tabs = state.availableTabs
+            TabRow(selectedTabIndex = tabs.indexOf(state.tab).coerceAtLeast(0)) {
+                tabs.forEach { tab ->
                     Tab(
-                        selected = state.tab == index,
-                        onClick = { vm.setTab(index) },
-                        text = { Text(title) },
+                        selected = state.tab == tab,
+                        onClick = { vm.setTab(tab) },
+                        text = { Text(tab.title) },
                     )
                 }
             }
@@ -286,9 +318,9 @@ fun ExamRecordsScreen(container: AppContainer, nav: NavController) {
             }
 
             when (state.tab) {
-                0 -> LocalTab(state, vm)
-                1 -> RemoteTab(state, vm)
-                else -> AllUsersTab(state, vm)
+                ExamRecordsViewModel.RecordTab.LOCAL -> LocalTab(state, vm)
+                ExamRecordsViewModel.RecordTab.CLOUD -> RemoteTab(state, vm)
+                ExamRecordsViewModel.RecordTab.ALL_USERS -> AllUsersTab(state, vm)
             }
         }
     }
@@ -406,8 +438,7 @@ private fun AllUsersTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsView
     if (state.users.isEmpty()) {
         return EmptyState(
             title = "没有读到任何用户的记录",
-            description = "成绩目录下还没有人上传考试记录；" +
-                "也可能是当前账号不是 alist 管理员——只有管理员才能查看别人的目录。",
+            description = "成绩目录下还没有人上传考试记录。",
             action = { Button(onClick = vm::loadAllUsers) { Text("重新读取") } },
         )
     }
