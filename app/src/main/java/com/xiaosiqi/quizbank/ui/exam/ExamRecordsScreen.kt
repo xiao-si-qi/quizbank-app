@@ -6,6 +6,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -192,6 +193,14 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
+    /** 放弃当前进度重新考：先删掉进行中的记录，再让调用方跳进考试页（会重新抽卷）。 */
+    fun restartExam(record: ExamRecord, onReady: () -> Unit) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { container.exams.deleteLocal(record.localId) }
+            onReady()
+        }
+    }
+
     fun deleteRecord(record: ExamRecord) {
         viewModelScope.launch {
             withContext(Dispatchers.IO) { container.exams.deleteLocal(record.localId) }
@@ -210,11 +219,14 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                             loading = false,
                             remote = result.records,
                             remoteSummary = ExamSummary.of(result.records),
-                            message = buildString {
-                                append("共读到 ${result.records.size} 条考试记录")
-                                if (result.failed > 0) append("，${result.failed} 个文件解析失败")
-                                if (result.errors.isNotEmpty()) append("\n" + result.errors.joinToString("\n"))
-                            },
+                            // 加载成功不弹窗，列表出来就行；
+                            // 只有真有文件读不出来（数据可能不完整）才提示一次
+                            message = if (result.failed > 0) {
+                                buildString {
+                                    append("有 ${result.failed} 个成绩文件没能读取")
+                                    if (result.errors.isNotEmpty()) append("：\n" + result.errors.joinToString("\n"))
+                                }
+                            } else null,
                         )
                     }
                 }
@@ -232,7 +244,6 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                             loadedTabs = it.loadedTabs + RecordTab.ALL_USERS,
                             loading = false,
                             users = users,
-                            message = if (users.isEmpty()) "成绩目录下还没有任何用户的考试记录。" else null,
                         )
                     }
                 }
@@ -279,6 +290,14 @@ fun ExamRecordsScreen(container: AppContainer, nav: NavController) {
         return
     }
 
+    // 进行中的记录不回顾题目，直接进考试页接着考（考试页会自动恢复那条记录）
+    val continueExam: (ExamRecord) -> Unit = { record ->
+        nav.navigate(com.xiaosiqi.quizbank.ui.Routes.exam(record.bankId))
+    }
+    val restartExam: (ExamRecord) -> Unit = { record ->
+        vm.restartExam(record) { nav.navigate(com.xiaosiqi.quizbank.ui.Routes.exam(record.bankId)) }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -318,9 +337,9 @@ fun ExamRecordsScreen(container: AppContainer, nav: NavController) {
             }
 
             when (state.tab) {
-                ExamRecordsViewModel.RecordTab.LOCAL -> LocalTab(state, vm)
-                ExamRecordsViewModel.RecordTab.CLOUD -> RemoteTab(state, vm)
-                ExamRecordsViewModel.RecordTab.ALL_USERS -> AllUsersTab(state, vm)
+                ExamRecordsViewModel.RecordTab.LOCAL -> LocalTab(state, vm, continueExam, restartExam)
+                ExamRecordsViewModel.RecordTab.CLOUD -> RemoteTab(state, vm, continueExam, restartExam)
+                ExamRecordsViewModel.RecordTab.ALL_USERS -> AllUsersTab(state, vm, continueExam, restartExam)
             }
         }
     }
@@ -337,7 +356,10 @@ fun ExamRecordsScreen(container: AppContainer, nav: NavController) {
 }
 
 @Composable
-private fun LocalTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsViewModel) {
+private fun LocalTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsViewModel,
+    onContinue: (ExamRecord) -> Unit,
+    onRestart: (ExamRecord) -> Unit,
+) {
     if (state.loading) return LoadingBox("正在读取本机记录…")
     if (state.local.isEmpty()) {
         return EmptyState(
@@ -357,13 +379,18 @@ private fun LocalTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsViewMod
                 onOpen = { vm.openDetail(record) },
                 onUpload = if (state.canUpload) ({ vm.uploadOne(record) }) else null,
                 onDelete = { vm.deleteRecord(record) },
+                onContinue = { onContinue(record) },
+                onRestart = { onRestart(record) },
             )
         }
     }
 }
 
 @Composable
-private fun RemoteTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsViewModel) {
+private fun RemoteTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsViewModel,
+    onContinue: (ExamRecord) -> Unit,
+    onRestart: (ExamRecord) -> Unit,
+) {
     if (!state.canUpload) {
         return EmptyState(
             title = "还没有设置上传目录",
@@ -388,13 +415,21 @@ private fun RemoteTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsViewMo
             OutlinedButton(onClick = vm::loadRemote, modifier = Modifier.fillMaxWidth()) { Text("重新读取") }
         }
         items(state.remote, key = { it.remotePath }) { record ->
-            ExamRecordCard(record = record, onOpen = { vm.openDetail(record) })
+            ExamRecordCard(
+                record = record,
+                onOpen = { vm.openDetail(record) },
+                onContinue = { onContinue(record) },
+                onRestart = { onRestart(record) },
+            )
         }
     }
 }
 
 @Composable
-private fun AllUsersTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsViewModel) {
+private fun AllUsersTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsViewModel,
+    onContinue: (ExamRecord) -> Unit,
+    onRestart: (ExamRecord) -> Unit,
+) {
     if (!state.canUpload) {
         return EmptyState(
             title = "还没有设置上传目录",
@@ -428,6 +463,8 @@ private fun AllUsersTab(state: ExamRecordsViewModel.UiState, vm: ExamRecordsView
                 ExamRecordCard(
                     record = record,
                     onOpen = { vm.openDetail(record) },
+                    onContinue = { onContinue(record) },
+                    onRestart = { onRestart(record) },
                     subtitle = record.user,
                 )
             }
@@ -530,8 +567,13 @@ private fun ExamRecordCard(
     onOpen: () -> Unit,
     onUpload: (() -> Unit)? = null,
     onDelete: (() -> Unit)? = null,
+    onContinue: (() -> Unit)? = null,
+    onRestart: (() -> Unit)? = null,
     subtitle: String = "",
 ) {
+    val inProgress = record.inProgress
+    // 没考完的：点卡片进考试接着考；已交卷的：点卡片回顾题目
+    val primaryAction = if (inProgress) (onContinue ?: onOpen) else onOpen
     Card(
         Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
@@ -539,7 +581,7 @@ private fun ExamRecordCard(
     ) {
         Column(Modifier.padding(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f).clickable(onClick = onOpen)) {
+                Column(Modifier.weight(1f).clickable(onClick = primaryAction)) {
                     Text(
                         record.bankName.ifBlank { "考试" },
                         style = MaterialTheme.typography.titleSmall,
@@ -564,31 +606,45 @@ private fun ExamRecordCard(
                             else MaterialTheme.colorScheme.error.copy(alpha = 0.12f)
                         )
                         .padding(horizontal = 10.dp, vertical = 6.dp)
-                        .clickable(onClick = onOpen)
+                        .clickable(onClick = primaryAction)
                 ) {
                     Text(
-                        "${record.percent} 分",
+                        if (inProgress) "进行中" else "${record.percent} 分",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
-                        color = if (record.percent >= 60) Color(0xFF16A34A) else MaterialTheme.colorScheme.error,
+                        color = if (inProgress) MaterialTheme.colorScheme.primary
+                        else if (record.percent >= 60) Color(0xFF16A34A) else MaterialTheme.colorScheme.error,
                     )
                 }
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                "${record.scoredPoints}/${record.totalPoints} 分 · ${record.correctCount} 对 ${record.wrongCount} 错" +
-                    if (record.selfGraded > 0) " · ${record.selfGraded} 题待自评" else "",
+                if (inProgress)
+                    "已答 ${record.details.count { it.my.isNotBlank() }}/${record.questionCount} 题 · " +
+                        "上次做到第 ${record.index + 1} 题 · 满分 ${record.totalPoints} 分"
+                else
+                    "${record.scoredPoints}/${record.totalPoints} 分 · ${record.correctCount} 对 ${record.wrongCount} 错" +
+                        if (record.selfGraded > 0) " · ${record.selfGraded} 题待自评" else "",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = onOpen) { Text("回顾题目") }
-                if (onUpload != null) {
-                    TextButton(onClick = onUpload) { Text(if (record.uploaded) "重新上传" else "上传") }
+                if (inProgress) {
+                    Button(onClick = primaryAction, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
+                        Text("继续考试")
+                    }
+                    if (onRestart != null) {
+                        TextButton(onClick = onRestart) { Text("重新开始") }
+                    }
+                } else {
+                    TextButton(onClick = onOpen) { Text("回顾题目") }
+                    if (onUpload != null) {
+                        TextButton(onClick = onUpload) { Text(if (record.uploaded) "重新上传" else "上传") }
+                    }
                 }
                 Spacer(Modifier.weight(1f))
-                if (record.uploaded) {
+                if (!inProgress && record.uploaded) {
                     Text(
                         "已上传",
                         style = MaterialTheme.typography.labelSmall,
