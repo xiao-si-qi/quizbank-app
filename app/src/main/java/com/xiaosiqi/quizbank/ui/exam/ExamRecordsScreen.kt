@@ -1,5 +1,6 @@
 package com.xiaosiqi.quizbank.ui.exam
 
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -92,6 +93,8 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
     data class UiState(
         val tab: RecordTab = RecordTab.LOCAL,
         val loading: Boolean = true,
+        /** 下拉刷新中：不清空已有列表，避免闪一下 */
+        val refreshing: Boolean = false,
         val busy: String? = null,
         val local: List<ExamRecord> = emptyList(),
         val summary: ExamSummary = ExamSummary(),
@@ -130,6 +133,16 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
         refreshLocal()
     }
 
+    /** 下拉刷新当前标签页（三个 tab 共用）。 */
+    fun pullRefresh(tab: RecordTab) {
+        _state.update { it.copy(refreshing = true) }
+        when (tab) {
+            RecordTab.LOCAL -> refreshLocal()
+            RecordTab.CLOUD -> loadRemote()
+            RecordTab.ALL_USERS -> loadAllUsers()
+        }
+    }
+
     fun refreshLocal() {
         viewModelScope.launch {
             val settings = container.settings.current()
@@ -141,6 +154,7 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
             _state.update {
                 val next = it.copy(
                     loading = false,
+                    refreshing = false,
                     local = records,
                     summary = summary,
                     canUpload = container.exams.hasUploadTarget(),
@@ -217,6 +231,7 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                         it.copy(
                             loadedTabs = it.loadedTabs + RecordTab.CLOUD,
                             loading = false,
+                            refreshing = false,
                             remote = result.records,
                             remoteSummary = ExamSummary.of(result.records),
                             // 加载成功不弹窗，列表出来就行；
@@ -230,7 +245,9 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                         )
                     }
                 }
-                .onFailure { e -> _state.update { it.copy(loading = false, error = e.message ?: "读取失败") } }
+                .onFailure { e ->
+                    _state.update { it.copy(loading = false, refreshing = false, error = e.message ?: "读取失败") }
+                }
         }
     }
 
@@ -243,6 +260,7 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                         it.copy(
                             loadedTabs = it.loadedTabs + RecordTab.ALL_USERS,
                             loading = false,
+                            refreshing = false,
                             users = users,
                         )
                     }
@@ -251,6 +269,7 @@ class ExamRecordsViewModel(private val container: AppContainer) : ViewModel() {
                     _state.update {
                         it.copy(
                             loading = false,
+                            refreshing = false,
                             error = e.message ?: "读取失败",
                             users = emptyList(),
                         )
@@ -336,10 +355,17 @@ fun ExamRecordsScreen(container: AppContainer, nav: NavController) {
                 )
             }
 
-            when (state.tab) {
-                ExamRecordsViewModel.RecordTab.LOCAL -> LocalTab(state, vm, continueExam, restartExam)
-                ExamRecordsViewModel.RecordTab.CLOUD -> RemoteTab(state, vm, continueExam, restartExam)
-                ExamRecordsViewModel.RecordTab.ALL_USERS -> AllUsersTab(state, vm, continueExam, restartExam)
+            // 三个标签页共用一层下拉刷新
+            PullToRefreshBox(
+                isRefreshing = state.refreshing,
+                onRefresh = { vm.pullRefresh(state.tab) },
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                when (state.tab) {
+                    ExamRecordsViewModel.RecordTab.LOCAL -> LocalTab(state, vm, continueExam, restartExam)
+                    ExamRecordsViewModel.RecordTab.CLOUD -> RemoteTab(state, vm, continueExam, restartExam)
+                    ExamRecordsViewModel.RecordTab.ALL_USERS -> AllUsersTab(state, vm, continueExam, restartExam)
+                }
             }
         }
     }
